@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+title: "RankPool: Rank-Weighted Pooling for Robust Feature Aggregation"
+type: software
+authors:
+  - given-names: XiaoxuStu
+    family-names: XiaoxuStu
+version: "1.0.0"
+date-released: "2026-06-03"
+url: "https://github.com/XiaoxuStu/RankPool"
+license: MIT
+keywords:
+  - pooling
+  - deep learning
+  - robustness
+  - convolutional neural networks
+  - feature aggregation

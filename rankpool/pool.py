@@ -1,132 +1,102 @@
-Core pooling layers.
+"""
+RankPool: Rank-Weighted Pooling for Robust Feature Aggregation
 
-RankPool2d   — Power mean weighted pooling (p=2 is RMS)
-RobustPool2d — RankPool + max_weight clamp
-SoftPool2d   — Exponentially weighted (softmax) pooling
-
+A pooling layer that assigns weights proportional to absolute values,
+achieving both high accuracy and strong robustness against occlusion.
+"""
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class RankPool2d(nn.Module)
-    rPower mean weighted pooling.
+class RankPool2d(nn.Module):
+    """
+    Rank-Weighted Pooling (RankPool).
 
-    Weight math`w_i = x_i^p  sum x_k^p`, output math`sum w_i cdot x_i`.
+    For each spatial pooling window, computes output as a weighted average
+    where weights are proportional to the absolute value of each element:
 
-     ``p=1`` → inverse-harmonic mean (weights ∝ x)
-     ``p=2`` → RMS-weighted mean (default)
-     ``p→∞`` → approaches MaxPool
+        w_i = |x_i|^p / Σ|x_j|^p
+        output = Σ(w_i * x_i)
 
-    Args
-        kernel_size (int or tuple) Pooling window size.
-        stride (int or tuple, optional) Defaults to kernel_size.
-        padding (int or tuple) Zero-padding added to both sides.
-        p (float) Power exponent (default ``2.0``).
-    
+    This naturally assigns higher weight to more salient features while
+    remaining differentiable everywhere.
 
-    def __init__(self, kernel_size, stride=None, padding=0, p=2.0)
+    Args:
+        kernel_size (int or tuple): Size of the pooling window.
+        stride (int or tuple, optional): Stride of the pooling window.
+            Default: same as kernel_size.
+        padding (int or tuple): Zero-padding added to both sides.
+            Default: 0.
+        p (float): Exponent controlling the sharpness of the weight
+            distribution. p=1 (default) assigns weights strictly
+            proportional to |x|. Higher p increases focus on the
+            maximum value (approaches MaxPool); lower p increases
+            uniformity (approaches AvgPool).
+
+            - p → 0: approaches AvgPool
+            - p = 1: standard RankPool (recommended)
+            - p → ∞: approaches MaxPool
+
+    Shape:
+        - Input:  (B, C, H_in, W_in)
+        - Output: (B, C, H_out, W_out)
+
+        H_out = floor((H_in + 2*padding - kernel_size) / stride) + 1
+        W_out = floor((W_in + 2*padding - kernel_size) / stride) + 1
+
+    Example:
+        >>> pool = RankPool2d(kernel_size=2, stride=2)
+        >>> x = torch.randn(16, 64, 32, 32)
+        >>> y = pool(x)
+        >>> y.shape
+        torch.Size([16, 64, 16, 16])
+    """
+
+    def __init__(self, kernel_size, stride=None, padding=0, p=1.0):
         super().__init__()
-        if isinstance(kernel_size, int)
+        if isinstance(kernel_size, int):
             kernel_size = (kernel_size, kernel_size)
         self.kernel_size = kernel_size
         self.stride = stride if stride else kernel_size
-        if isinstance(self.stride, int)
+        if isinstance(self.stride, int):
             self.stride = (self.stride, self.stride)
-        if isinstance(padding, int)
+        if isinstance(padding, int):
             self.padding = (padding, padding)
         self.p = p
 
-    def forward(self, x)
+    def forward(self, x):
         B, C, H, W = x.shape
-        N = self.kernel_size[0]  self.kernel_size[1]
+        kh, kw = self.kernel_size
+        sh, sw = self.stride
+        ph, pw = self.padding
+        N = kh * kw
+
+        # Extract patches: (B, C*N, L)
         patches = F.unfold(x, self.kernel_size,
                            stride=self.stride, padding=self.padding)
         L = patches.shape[2]
+        # Reshape: (B, C, N, L)
         patches = patches.view(B, C, N, L)
-        w = patches.abs().pow(self.p)
-        w = w  (w.sum(dim=2, keepdim=True) + 1e-8)
-        output = (w  patches).sum(dim=2)
-        H_out = (H + 2  self.padding[0] - self.kernel_size[0])  self.stride[0] + 1
-        W_out = (W + 2  self.padding[1] - self.kernel_size[1])  self.stride[1] + 1
+
+        # Compute rank weights
+        if self.p == 1.0:
+            abs_patches = patches.abs()
+        else:
+            abs_patches = patches.abs().clamp(min=1e-8).pow(self.p)
+
+        w = abs_patches / (abs_patches.sum(dim=2, keepdim=True) + 1e-8)
+
+        # Weighted aggregation using original (signed) values
+        output = (w * patches).sum(dim=2)
+
+        # Compute output spatial dimensions
+        H_out = (H + 2 * ph - kh) // sh + 1
+        W_out = (W + 2 * pw - kw) // sw + 1
+
         return output.view(B, C, H_out, W_out)
 
-
-class RobustPool2d(nn.Module)
-    RankPool with max-weight clamp.
-
-    Clamps the maximum pooling weight to ``max_weight`` and renormalises,
-    preventing a single element from fully dominating the output.
-
-    Args
-        kernel_size (int or tuple) Pooling window size.
-        stride (int or tuple, optional) Defaults to kernel_size.
-        padding (int or tuple) Zero-padding added to both sides.
-        max_weight (float, optional) Weight cap (default ``1N``).
-    
-
-    def __init__(self, kernel_size, stride=None, padding=0, max_weight=None)
-        super().__init__()
-        if isinstance(kernel_size, int)
-            kernel_size = (kernel_size, kernel_size)
-        self.kernel_size = kernel_size
-        self.stride = stride if stride else kernel_size
-        if isinstance(self.stride, int)
-            self.stride = (self.stride, self.stride)
-        if isinstance(padding, int)
-            self.padding = (padding, padding)
-        N = kernel_size[0]  kernel_size[1]
-        self.max_weight = max_weight if max_weight is not None else 1.0  N
-
-    def forward(self, x)
-        B, C, H, W = x.shape
-        N = self.kernel_size[0]  self.kernel_size[1]
-        patches = F.unfold(x, self.kernel_size,
-                           stride=self.stride, padding=self.padding)
-        L = patches.shape[2]
-        patches = patches.view(B, C, N, L)
-        abs_sum = patches.abs().sum(dim=2, keepdim=True) + 1e-8
-        w = patches.abs()  abs_sum
-        w = torch.clamp(w, max=self.max_weight)
-        w = w  (w.sum(dim=2, keepdim=True) + 1e-8)
-        output = (w  patches).sum(dim=2)
-        H_out = (H + 2  self.padding[0] - self.kernel_size[0])  self.stride[0] + 1
-        W_out = (W + 2  self.padding[1] - self.kernel_size[1])  self.stride[1] + 1
-        return output.view(B, C, H_out, W_out)
-
-
-class SoftPool2d(nn.Module)
-    Exponentially weighted (softmax) pooling.
-
-    Args
-        kernel_size (int or tuple) Pooling window size.
-        stride (int or tuple, optional) Defaults to kernel_size.
-        padding (int or tuple) Zero-padding added to both sides.
-        tau (float) Temperature for softmax (default ``1.0``).
-    
-
-    def __init__(self, kernel_size, stride=None, padding=0, tau=1.0)
-        super().__init__()
-        if isinstance(kernel_size, int)
-            kernel_size = (kernel_size, kernel_size)
-        self.kernel_size = kernel_size
-        self.stride = stride if stride else kernel_size
-        if isinstance(self.stride, int)
-            self.stride = (self.stride, self.stride)
-        if isinstance(padding, int)
-            self.padding = (padding, padding)
-        self.tau = tau
-
-    def forward(self, x)
-        B, C, H, W = x.shape
-        N = self.kernel_size[0]  self.kernel_size[1]
-        patches = F.unfold(x, self.kernel_size,
-                           stride=self.stride, padding=self.padding)
-        L = patches.shape[2]
-        patches = patches.view(B, C, N, L)
-        w = F.softmax(patches  self.tau, dim=2)
-        output = (w  patches).sum(dim=2)
-        H_out = (H + 2  self.padding[0] - self.kernel_size[0])  self.stride[0] + 1
-        W_out = (W + 2  self.padding[1] - self.kernel_size[1])  self.stride[1] + 1
-        return output.view(B, C, H_out, W_out)
+    def extra_repr(self):
+        return (f"kernel_size={self.kernel_size}, stride={self.stride}, "
+                f"padding={self.padding}, p={self.p}")
